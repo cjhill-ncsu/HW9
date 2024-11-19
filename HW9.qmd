@@ -1,0 +1,400 @@
+---
+title: "HW9"
+author: "Chris Hill"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+#| message: false
+#| warning: false
+
+library(tidyverse)
+library(tidymodels)
+library(baguette)
+library(doParallel)
+library(vip)
+library(rpart.plot)
+library(broom)
+library(iml)
+
+set.seed(11)
+
+
+bike_data <- read_csv("https://www4.stat.ncsu.edu/~online/datasets/SeoulBikeData.csv", 
+                      locale = locale(encoding = "latin1"))
+```
+
+```{r}
+#| echo: false
+#| message: false
+
+cl <- makePSOCKcluster(parallel::detectCores() - 1) 
+registerDoParallel(cl)
+```
+
+## Consolidated Data Manipulations From HW8
+
+```{r}
+bike_data <- bike_data |>
+  mutate(
+    date = lubridate::dmy(Date),
+    seasons = factor(Seasons),
+    holiday = factor(Holiday),
+    fn_day = factor(`Functioning Day`)
+  ) |>
+  select(-Date, -Seasons, -Holiday, -`Functioning Day`) |>
+  rename(
+    bike_count = `Rented Bike Count`,
+    hour = Hour,
+    temp = `Temperature(°C)`,
+    wind_speed = `Wind speed (m/s)`,
+    humidity = `Humidity(%)`,
+    vis = `Visibility (10m)`,
+    dew_point_temp = `Dew point temperature(°C)`,
+    solar_radiation = `Solar Radiation (MJ/m2)`,
+    rainfall = `Rainfall(mm)`,
+    snowfall = `Snowfall (cm)`
+  ) |>
+  filter(fn_day == "Yes") |>
+  group_by(date, seasons, holiday) |>
+  summarize(
+    bike_count = sum(bike_count),
+    temp = mean(temp),
+    humidity = mean(humidity),
+    wind_speed = mean(wind_speed),
+    vis = mean(vis),
+    dew_point_temp = mean(dew_point_temp),
+    solar_radiation = mean(solar_radiation),
+    rainfall = sum(rainfall),
+    snowfall = sum(snowfall),
+    .groups = "drop"
+  )
+
+glimpse(bike_data)
+```
+
+## Data Split
+
+```{r}
+bike_split <- initial_split(bike_data, 
+                            prop = 0.75, 
+                            strata = seasons)
+bike_train <- training(bike_split)
+bike_test <- testing(bike_split)
+bike_folds <- vfold_cv(bike_train, v = 10)
+```
+
+**For all models, fit_resamples() and tune_grid() functions are applied to the bike_folds. This ensures all tuning and fitting is performed on the training set.**
+
+## Best Model From HW8
+
+### Recipe (Model 3 with Interactions and Polynomials)
+
+```{r}
+MLR_rec3 <- recipe(bike_count ~ ., data = bike_train) |>
+  step_date(date, features = "dow") |>
+  step_mutate(day_type = factor(
+    if_else(date_dow %in% c("Sat", "Sun"), "Weekend", "Weekday"))) |>
+  step_rm(date, date_dow) |>
+  step_dummy(seasons, holiday, day_type) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_interact(terms = ~ starts_with("seasons") * starts_with("holiday") +
+                  starts_with("seasons") * temp +
+                  temp * rainfall) |>
+  step_poly(temp, wind_speed, vis, dew_point_temp, solar_radiation, rainfall, snowfall, degree = 2)
+
+```
+
+### MLR Spec, Workflow, and Fit
+
+```{r}
+# Ensure we have RMSE and MAE metrics
+metrics <- metric_set(rmse, mae)
+
+MLR_spec <- linear_reg() |>
+  set_engine("lm")
+
+MLR_workflow <- workflow() |>
+  add_recipe(MLR_rec3) |>
+  add_model(MLR_spec)
+
+MLR_CV_fit <- fit_resamples(MLR_workflow, 
+                            resamples = bike_folds,
+                            metrics = metrics)
+
+MLR_final_fit <- last_fit(MLR_workflow, 
+                          split = bike_split,
+                          metrics = metrics)
+```
+
+## New Models
+
+### LASSO
+
+```{r}
+#| cache: true
+
+lasso_spec <- linear_reg(penalty = tune(), 
+                         mixture = 1) |>
+  set_engine("glmnet")
+
+lasso_grid <- grid_regular(penalty(range = c(-3, 0)), 
+                           levels = 10)
+
+lasso_workflow <- workflow() |>
+  add_recipe(MLR_rec3) |>
+  add_model(lasso_spec)
+
+lasso_res <- tune_grid(
+  lasso_workflow,
+  resamples = bike_folds,
+  grid = lasso_grid,
+  metrics = metrics,
+  # For Parallel Processing 
+  control = control_grid(parallel_over = "everything")
+)
+
+best_lasso <- select_best(lasso_res, 
+                          metric = "rmse")
+
+final_lasso <- finalize_workflow(lasso_workflow, 
+                                 best_lasso)
+
+lasso_test <- last_fit(final_lasso, 
+                       split = bike_split,
+                       metrics = metrics)
+```
+
+### Decision Tree
+
+```{r}
+#| cache: true
+
+tree_spec <- decision_tree(cost_complexity = tune(), 
+                           tree_depth = tune()) |>
+  set_engine("rpart") |>
+  set_mode("regression")
+
+tree_grid <- grid_regular(cost_complexity(), 
+                          tree_depth(), 
+                          levels = 10)
+
+tree_workflow <- workflow() |>
+  add_recipe(MLR_rec3) |>
+  add_model(tree_spec)
+
+tree_res <- tune_grid(
+  tree_workflow,
+  resamples = bike_folds,
+  grid = tree_grid,
+  metrics = metrics,
+  # For Parallel Processing 
+  control = control_grid(parallel_over = "everything")
+)
+
+best_tree <- select_best(tree_res, 
+                         metric = "rmse")
+
+final_tree <- finalize_workflow(tree_workflow, 
+                                best_tree)
+
+tree_test <- last_fit(final_tree, 
+                      split = bike_split,
+                      metrics = metrics)
+```
+
+### Bagged Tree
+
+```{r}
+#| cache: true
+
+bagged_tree_spec <- bag_tree(cost_complexity = tune(), 
+                             tree_depth = tune()) |>
+  set_engine("rpart", times = 50) |>
+  set_mode("regression")
+
+bagged_tree_grid <- grid_regular(cost_complexity(), 
+                                 tree_depth(), levels = 10)
+
+bagged_tree_workflow <- workflow() |>
+  add_recipe(MLR_rec3) |>
+  add_model(bagged_tree_spec)
+
+bagged_tree_res <- tune_grid(
+  bagged_tree_workflow,
+  resamples = bike_folds,
+  grid = bagged_tree_grid,
+  metrics = metrics,
+  # For Parallel Processing 
+  control = control_grid(parallel_over = "everything")
+)
+
+best_bagged_tree <- select_best(bagged_tree_res, 
+                                metric = "rmse")
+
+final_bagged_tree <- finalize_workflow(bagged_tree_workflow, 
+                                       best_bagged_tree)
+
+bagged_tree_test <- last_fit(final_bagged_tree, 
+                             split = bike_split,
+                             metrics = metrics)
+```
+
+### Random Forest
+
+```{r}
+#| cache: true
+
+rf_spec <- rand_forest(mtry = tune(), 
+                       trees = 500, 
+                       min_n = tune()) |>
+  set_engine("ranger", 
+             importance = "permutation") |>
+  set_mode("regression")
+
+rf_grid <- grid_regular(mtry(range = c(1, 10)), 
+                        min_n(range = c(2, 10)), 
+                        levels = 10)
+
+rf_workflow <- workflow() |>
+  add_recipe(MLR_rec3) |>
+  add_model(rf_spec)
+
+rf_res <- tune_grid(
+  rf_workflow,
+  resamples = bike_folds,
+  grid = rf_grid,
+  metrics = metrics,
+  # For Parallel Processing 
+  control = control_grid(parallel_over = "everything")
+)
+
+best_rf <- select_best(rf_res, metric = "rmse")
+
+final_rf <- finalize_workflow(rf_workflow, 
+                              best_rf)
+
+rf_test <- last_fit(final_rf, 
+                    split = bike_split,
+                    metrics = metrics)
+```
+
+```{r}
+#| echo: false
+#| message: false
+
+stopCluster(cl)
+```
+
+## Test Metrics
+
+```{r}
+test_metrics <- bind_rows(
+  collect_metrics(MLR_final_fit),
+  collect_metrics(lasso_test),
+  collect_metrics(tree_test),
+  collect_metrics(bagged_tree_test),
+  collect_metrics(rf_test)
+) |>
+  mutate(model = rep(c("MLR", "LASSO", "Tree", "Bagged Tree", "Random Forest"), 
+                     each = 2))
+
+rmse_table <- test_metrics |>
+  filter(.metric == "rmse") |>
+  arrange(.estimate)
+
+knitr::kable(rmse_table, 
+             caption = "Model Comparison Based on RMSE")
+
+mae_table <- test_metrics |>
+  filter(.metric == "mae") |>
+  arrange(.estimate)
+
+knitr::kable(mae_table, 
+             caption = "Model Comparison Based on MAE")
+
+```
+
+**Bagged Tree had the lowest RMSE and MAE!**
+
+## Extract the Final Model Fits and Report a Summary of the Model
+
+*Note: I took "Final" to mean to fit each model using the entire dataset*
+
+### MLR
+
+```{r}
+mlr_coefficients <- MLR_workflow |>
+  fit(data = bike_data) |>
+  extract_fit_parsnip() |>
+  tidy()
+
+knitr::kable(mlr_coefficients, 
+             caption = "MLR Coefficients")
+```
+
+
+### LASSO
+
+```{r}
+lasso_coefficients <- final_lasso |>
+  fit(data = bike_data) |>
+  extract_fit_parsnip() |>
+  tidy()
+
+knitr::kable(lasso_coefficients, 
+             caption = "LASSO Coefficients")
+```
+
+### Decision Tree
+
+```{r}
+final_tree |>
+  fit(data = bike_data) |>
+  extract_fit_parsnip() |>
+  extract_fit_engine() |>
+  rpart.plot::rpart.plot(main = "Regression Tree Plot",
+                         roundint=FALSE)
+```
+
+### Random Forest
+
+```{r}
+rf_vip <- final_rf |>
+  fit(data = bike_data) |>
+  extract_fit_parsnip() |>
+  vip::vip()
+
+rf_vip
+```
+
+## Overall Best Model
+
+### Bagged Tree had the Lowest RMSE and MAE!
+
+```{r}
+bagged_tree_fit <- final_bagged_tree |> fit(data = bike_data)
+
+bag_final_model <- extract_fit_engine(bagged_tree_fit)
+
+bagged_tree_vip <- bag_final_model$imp |>
+  mutate(term = forcats::fct_reorder(term, value)) |>
+  ggplot(aes(x = term, y = value)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(
+    title = "Variable Importance for Bagged Tree Model",
+    x = "Predictors",
+    y = "Importance Score"
+  ) +
+  theme_minimal()
+
+bagged_tree_vip
+bagged_tree_fit |> 
+  extract_fit_parsnip()
+```
+
+
